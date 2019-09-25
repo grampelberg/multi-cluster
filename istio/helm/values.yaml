@@ -1,0 +1,51 @@
+# grafana:
+#     enabled: true
+
+# tracing:
+#     enabled: true
+
+# kiali:
+#     enabled: true
+
+# certmanager:
+#     enabled: true
+
+istiocoredns:
+    enabled: true
+
+security:
+    selfSigned: false
+
+gateways:
+    istio-egressgateway:
+        enabled: true
+        env:
+            # Needed to route traffic via egress gateway if desired.
+            ISTIO_META_REQUESTED_NETWORK_VIEW: "external"
+
+global:
+    # k8sIngress:
+    #     enabled: true
+    #     enableHttps: true
+
+    multiCluster:
+        enabled: true
+
+    # mtls:
+    #     enabled: true
+
+    # sds:
+    #     enabled: true
+
+    controlPlaneSecurityEnabled: true
+
+    logging:
+        level: all:debug
+
+    proxy:
+        accssLogFile: /dev/stdout
+        logLevel: debug
+
+    podDNSSearchNamespaces:
+    - global
+    - "{{ valueOrDefault .DeploymentMeta.Namespace \"default\" }}.global"
