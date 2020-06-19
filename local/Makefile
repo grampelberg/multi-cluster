@@ -7,26 +7,29 @@ MAKEFLAGS += --no-builtin-rules
 
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 CURRENT_DIR := $(notdir $(patsubst %/,%,$(dir $(MKFILE_PATH))))
+TMP_DIR := /tmp/multicluster
+
+export PATH := ~/.linkerd2/bin:$(PATH)
 
 HAS_K3D := $(shell command -v k3d;)
+HAS_LINKERD := $(shell ls ~/.linkerd2/bin/linkerd;)
+HAS_STEP := $(shell command -v step;)
 
-CLUSTER_NAMES ?= left right
-WAIT ?= 360
-
-CURRENT_CLUSTER ?=
-CMD ?=
-
-export KUBECONFIG := $(shell k3d get-kubeconfig --name='$(CURRENT_CLUSTER)' 2>/dev/null || true)
-
-define kubectl
-KUBECONFIG=$$(k3d get-kubeconfig --name='$(1)') && kubectl
-endef
+CLUSTER_NAMES ?= east west
 
 .PHONY: bootstrap
-bootstrap:
+bootstrap: | tmp
 	@# Bootstrap the local dependencies
 ifndef HAS_K3D
-	curl -s https://raw.githubusercontent.com/rancher/k3d/master/install.sh | bash
+	curl -s https://raw.githubusercontent.com/rancher/k3d/master/install.sh | TAG=v3.0.0-rc.6 bash
+endif
+ifndef HAS_LINKERD
+	curl -sL run.linkerd.io/install | bash
+endif
+ifndef HAS_STEP
+	curl -sL https://github.com/smallstep/cli/releases/download/v0.14.4/step-cli_0.14.4_amd64.deb \
+		-o $(TMP_DIR)/step.deb \
+	&& sudo dpkg -i $(TMP_DIR)/step.deb
 endif
 
 .PHONY: get-port
@@ -34,8 +37,8 @@ get-port:
 	@netstat -aln | awk ' \
 		$$6 == "LISTEN" { \
 			if ($$4 ~ "[.:][0-9]+$$") { \
-				split($$4, a, /[:.]/); \
-				port = a[length(a)]; \
+				len = split($$4, a, /[:.]/); \
+				port = a[len]; \
 				p[port] = 1 \
 			} \
 		} \
@@ -46,6 +49,12 @@ get-port:
 		} \
 	'
 
+.PHONY: get-ip
+get-ip-%:
+	@docker inspect \
+		-f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+		k3d-$*-master-0
+
 .PHONY: create-cluster
 create-cluster: $(addprefix create-cluster-,$(CLUSTER_NAMES))
 
@@ -53,24 +62,66 @@ create-cluster: $(addprefix create-cluster-,$(CLUSTER_NAMES))
 delete-cluster: $(addprefix delete-cluster-,$(CLUSTER_NAMES))
 
 create-cluster-%:
-	PORT=$$($(MAKE) get-port); k3d create \
-		--name $* \
+	PORT=$$($(MAKE) --no-print-directory get-port); \
+		k3d create cluster $* \
+		--update-kubeconfig \
+		--wait \
 		--api-port $${PORT} \
-		--publish $$(($${PORT} + 80)):80 $$(($${PORT} + 443)):443
-	grep -m 1 "Successfully registered node" \
-		<(docker logs $$(docker ps -f "label=cluster=$*" -q) -f 2>&1)
+		--port $$(($${PORT} + 80)):80@loadbalancer \
+		--port $$(($${PORT} + 443)):443@loadbalancer \
+	&& kubectl config set-cluster k3d-$* \
+		--server=https://$$($(MAKE) --no-print-directory get-ip-$*):6443
 
 delete-cluster-%:
-	k3d delete --name $* || true
+	k3d delete cluster $* || true
 
 .PHONY: install-deps
-install-deps: $(addprefix install-deps-,$(CLUSTER_NAMES))
+install-linkerd: cluster-issuer $(addprefix install-linkerd-,$(CLUSTER_NAMES))
 
-install-deps-%:
-	$(call kubectl,$*) apply -f k8s
+install-linkerd-%:
+	linkerd --context=k3d-$* install \
+		--identity-trust-anchors-file=$(TMP_DIR)/anchor.cert \
+		--identity-issuer-certificate-file=$(TMP_DIR)/$*.issuer.cert \
+		--identity-issuer-key-file=$(TMP_DIR)/$*.issuer.key | \
+	kubectl --context=k3d-$* apply -f - && \
+	linkerd check
+
+.PHONY: install-mc
+install-mc: install-linkerd $(addprefix install-mc-,$(CLUSTER_NAMES))
+
+install-mc-%:
+	linkerd --context=k3d-$* mc install | \
+		kubectl --context=k3d-$* apply -f - \
+	&& linkerd check --multicluster
+
+.PHONY: trust-anchor
+trust-anchor: | tmp
+	step certificate create \
+		anchor.trust.cluster.local \
+		$(TMP_DIR)/anchor.cert \
+		$(TMP_DIR)/anchor.key \
+		--profile root-ca \
+		--no-password  --insecure --force
+
+.PHONY: cluster-issuer
+cluster-issuer: $(addprefix cluster-issuer-,$(CLUSTER_NAMES))
+
+cluster-issuer-%: | trust-anchor
+	step certificate create \
+		identity.linkerd.cluster.local \
+		$(TMP_DIR)/$*.issuer.cert \
+		$(TMP_DIR)/$*.issuer.key \
+		--ca=$(TMP_DIR)/anchor.cert \
+		--ca-key=$(TMP_DIR)/anchor.key \
+		--profile=intermediate-ca \
+		--not-after 8760h --no-password --insecure --force
+
+tmp:
+	mkdir -p $(TMP_DIR)
 
 .PHONY: clean
 clean: delete-cluster
+	rm -rf $(TMP_DIR)
 
 .PHONY: help
 help:
